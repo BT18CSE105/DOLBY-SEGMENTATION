@@ -1,0 +1,245 @@
+
+
+import os
+import cv2
+import numpy as np
+import torch
+import torchvision.models as models
+import torchvision.transforms as T
+from scipy.signal import savgol_filter
+
+from scenedetect import VideoManager, SceneManager
+from scenedetect.detectors import AdaptiveDetector
+
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+model = models.resnet18(pretrained=True)
+model = torch.nn.Sequential(*list(model.children())[:-1])
+model.eval().to(device)
+
+transform = T.Compose([
+    T.ToPILImage(),
+    T.Resize((224, 224)),
+    T.ToTensor()
+])
+
+
+def get_video_info(video_path):
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cap.release()
+    return fps, total_frames, width, height
+
+
+def get_candidate_scenes(video_path):
+    video_manager = VideoManager([video_path])
+    scene_manager = SceneManager()
+
+    scene_manager.add_detector(
+        AdaptiveDetector(
+            adaptive_threshold=3.0,   # - sensitivity (lower → more cuts)
+            window_width=25,          # - handles gradual transitions
+            min_scene_len=10          # - avoid tiny segments
+        )
+    )
+
+    video_manager.start()
+    scene_manager.detect_scenes(frame_source=video_manager)
+
+    scenes = scene_manager.get_scene_list()
+
+    if len(scenes) == 0:
+        total = int(cv2.VideoCapture(video_path).get(cv2.CAP_PROP_FRAME_COUNT))
+        return [(0, total)]
+
+    return [(s[0].get_frames(), s[1].get_frames()) for s in scenes]
+
+
+def extract_features(video_path, start, end, skip=3):  # - speed vs accuracy
+    cap = cv2.VideoCapture(video_path)
+
+    features = []
+    frames = []
+    frame_ids = []
+
+    for i in range(start, end, skip):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        inp = transform(frame).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            feat = model(inp).squeeze().cpu().numpy()
+
+        features.append(feat)
+        frames.append(frame)
+        frame_ids.append(i)
+
+    cap.release()
+    return features, frames, frame_ids
+
+
+def compute_flow(frames):
+    flows = []
+
+    prev_gray = cv2.cvtColor(frames[0], cv2.COLOR_BGR2GRAY)
+
+    for i in range(1, len(frames)):
+        gray = cv2.cvtColor(frames[i], cv2.COLOR_BGR2GRAY)
+
+        flow = cv2.calcOpticalFlowFarneback(
+            prev_gray, gray,
+            None, 0.5, 3, 15, 3, 5, 1.2, 0
+        )
+
+        mag = np.linalg.norm(flow, axis=2).mean()
+        flows.append(mag)
+
+        prev_gray = gray
+
+    flows.insert(0, 0)
+    return np.array(flows)
+
+def compute_final_score(features, frames, k=12):  #  window size
+    scores = []
+
+    for i in range(len(features)):
+        if i < k or i >= len(features) - k:
+            scores.append(0)
+            continue
+
+        dist = np.linalg.norm(features[i + k] - features[i - k])
+        scores.append(dist)
+
+    scores = np.array(scores)
+
+    # normalize appearance
+    scores = (scores - scores.min()) / (scores.max() + 1e-8)
+
+    # motion
+    flow = compute_flow(frames)
+    flow = (flow - flow.min()) / (flow.max() + 1e-8)
+
+    # combine
+    final_score = scores - 0.5 * flow   # - motion suppression strength
+
+    # smooth
+    final_score = savgol_filter(final_score, 11, 2)  # - smoothing window
+
+    return final_score
+
+def detect_peaks(score, frame_ids, threshold=0.21):  # - detection threshold
+    peaks = []
+
+    for i in range(1, len(score) - 1):
+        if score[i] > score[i-1] and score[i] > score[i+1]:
+            if score[i] > threshold:
+                peaks.append(frame_ids[i])
+
+    return peaks
+
+
+def fallback_segments(total_frames, fps, interval_sec=5):
+    step = int(interval_sec * fps)
+    return list(range(step, total_frames, step))
+
+
+def build_segments(boundaries, total_frames):
+    boundaries = sorted(set(boundaries))
+
+    segments = []
+    prev = 0
+
+    for b in boundaries:
+        segments.append((prev, b))
+        prev = b
+
+    segments.append((prev, total_frames))
+    return segments
+
+
+def get_temporal_segments(video_path):
+    fps, total_frames, _, _ = get_video_info(video_path)
+
+    candidate_scenes = get_candidate_scenes(video_path)
+
+    boundaries = []
+
+    for (start, end) in candidate_scenes:
+        features, frames, frame_ids = extract_features(video_path, start, end)
+
+        if len(features) < 20:
+            continue
+
+        score = compute_final_score(features, frames)
+        peaks = detect_peaks(score, frame_ids)
+
+        boundaries.extend(peaks)
+
+    if len(boundaries) == 0:
+        print("No segments detected → fallback used")
+        boundaries = fallback_segments(total_frames, fps)
+
+    segments = build_segments(boundaries, total_frames)
+
+    segments_time = [
+        (round(s / fps, 2), round(e / fps, 2))
+        for (s, e) in segments
+    ]
+
+    return segments_time
+
+
+def save_video_segments(video_path, segments, output_dir="aranyerdinratri_new_segments"):
+    os.makedirs(output_dir, exist_ok=True)
+
+    cap = cv2.VideoCapture(video_path)
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+    for idx, (start_sec, end_sec) in enumerate(segments):
+        start_frame = int(start_sec * fps)
+        end_frame = int(end_sec * fps)
+
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+        out_path = os.path.join(output_dir, f"segment_{idx}.mp4")
+        out = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
+
+        for _ in range(start_frame, end_frame):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            out.write(frame)
+
+        out.release()
+        print(f"Saved: {out_path}")
+
+    cap.release()
+
+
+if __name__ == "__main__":
+    video_path = r"C:\Users\Arghyadeep Dhar\Downloads\aranyaerdinratri.mp4"
+
+    print("Processing video...")
+    segments = get_temporal_segments(video_path)
+
+    print("\nSegments:")
+    for i, (s, e) in enumerate(segments):
+        print(f"{i}: {s}s → {e}s")
+
+    print("\nSaving segments...")
+    save_video_segments(video_path, segments)
+
+    print("\nDone.")
